@@ -1,0 +1,687 @@
+---
+header-includes:
+- \usepackage{lipsum}
+- \usepackage{amsmath}
+- \usepackage{bbm}
+- \usepackage{amssymb}
+- \usepackage[normalem]{ulem}
+- \usepackage{pgfplots}
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyhead[LE, LO]{}
+- \fancyhead[CE, CO]{}
+- \fancyhead[RE, RO]{Sam Mason (1058231)}
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+# Data Dictionary
+
+1.  Time: as the time (in years) since seroconversion, where a negative time denotes actual time
+before seroconversion.
+2. Age: age at seroconversion (a baseline measurement), centred at 30 years of age, so that negative
+ages denote years younger than 30.
+3. Packs: the number of packets of cigarettes smoked per day at time of measurement.
+4. Drugs: a binary variable taking the values 1 or 0 to denote if the respondent takes recreational
+drugs or not respectively, measured at each time point.
+5. Cesd: an index of depression measured at each time point, with time trends removed. Higher
+scores indicate greater depressive symptoms.
+6. Sex: number of sexual partners reported at each time point. Looks to have been centred somehow
+and truncated at ±5.
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center', out.width = '75%', out.height = '75%')
+```
+# Setup
+
+```{r message=FALSE}
+library(knitr)
+library(tinytex)
+library(kableExtra)
+library(latex2exp)
+library(tidyverse)
+library(gridExtra)
+library(nlme)
+library(lmtest)
+library(splines)
+```
+Load dataset and create engineered features for later use.
+```{r}
+cd4_df <- read.table("cd4data.txt", header = TRUE)
+cd4_df <- cd4_df %>% 
+  mutate(
+    CD4sqrt = CD4^0.5,
+    yr = round(Time),
+    yr.f = factor(yr, levels=c(-3,-2,-1,0,1,2,3,4,5)),
+    quarter = round(4*Time)/4,
+    smoker = ifelse(Packs > 0, 1, 0)
+  ) %>% 
+  arrange(ID, Time) %>% 
+  group_by(ID) %>% 
+  mutate(
+    obsnum = 1:n()
+  )
+```
+
+# Exploratory Data Analysis
+
+Look at how number of subjects and observations varied over the course of the study.
+```{r message=FALSE, results='asis'}
+obs_per_year_df <- cd4_df %>% group_by(yr) %>% summarise(obs_cnt=n())
+subs_per_year_df <- cd4_df %>% select(yr, ID) %>% distinct %>% group_by(yr) %>% summarise(sub_cnt=n())
+sub_obs_df <- tibble(
+  Year = obs_per_year_df$yr,
+  Num.Observations = obs_per_year_df$obs_cnt,
+  Num.Subjects = subs_per_year_df$sub_cnt 
+)
+kable(t(sub_obs_df), caption="Study Observations Profile", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+**Plot response curves over time** : build a dataframe for the means at each time point
+
+```{r message=F, warning=FALSE, out.width = '65%', out.height = '65%'}
+x <- sort(unique(cd4_df$yr))
+means_df <- cd4_df %>% 
+  select(yr, CD4sqrt) %>% 
+  group_by(yr) %>% 
+  summarise(mean_response = mean(CD4sqrt)) %>% 
+  arrange(yr)
+
+y_lim = c(floor(min(cd4_df$CD4sqrt)), ceiling(max(cd4_df$CD4sqrt)))
+y_scale <- seq(floor(min(cd4_df$CD4sqrt)), ceiling(max(cd4_df$CD4sqrt)))
+
+ggplot(cd4_df)+
+  geom_line(aes(x=yr, y=CD4sqrt, group=ID), color='lightblue')+
+  geom_point(aes(x=yr, y=CD4sqrt, group=ID), shape=1, color='lightblue')+
+  xlab('Time (Years)')+ ylab('CD4 Sqrt')+scale_x_continuous(breaks=x)+
+  geom_vline(xintercept = 0, colour='black', lty=5)+
+  annotate("text", label = "Seroconversion time", x = 0.1, y = 55, size = 5, colour = "black", hjust=0)+
+  geom_line(data = means_df, aes(x=yr, y=mean_response, colour='red'), lwd=1)+
+  geom_smooth(aes(x=yr, y=CD4sqrt, colour='darkgreen'), se = F, method='loess', span=0.75)+
+  geom_smooth(aes(x=yr, y=CD4sqrt, colour='steelblue'), se = F, method='glm')+
+  scale_colour_manual(values=c('red', 'darkgreen', 'steelblue'), 
+                      labels=c('Mean response', 'Lowess', 'Least squares'))+
+  theme(legend.title = element_blank())
+```
+**Plot a sample subset of responses**:
+
+```{r message=F, out.width = '65%', out.height = '65%'}
+# these were originally randomly generated
+sample_sids <- c(20439,41829,41844,30693,40942,30820,20777,40286, 30489,30075,30827,
+                 20205,41566,21083,41253,10302,40807,30835,20768,41194)
+sample_df <- cd4_df %>% filter(ID %in% sample_sids)
+ggplot(sample_df)+
+  geom_line(aes(x=yr, y=CD4sqrt, group=ID), color=sample_df$ID)+
+  geom_point(aes(x=yr, y=CD4sqrt, group=ID), shape=1, color=sample_df$ID)+
+  scale_x_continuous(breaks=x)+
+  geom_vline(xintercept = 0, colour='black', lty=5)+
+  annotate("text", label = "Seroconversion time", x = 0.1, y = 55, size = 5, colour = "black", hjust=0)+
+  xlab('Time (Years)')+ ylab('CD4 Sqrt')+
+  geom_line(data = means_df, aes(x=yr, y=mean_response), colour='red', lwd=1)+
+  theme(legend.title = element_blank())
+```
+
+**Sample Variagram** based on code from Week 2 lecture material. Use residuals from a simple spline fit.
+
+```{r message=FALSE}
+cd4_df$resid <- resid(smooth.spline(cd4_df$yr, cd4_df$CD4sqrt))
+# sample variogram from week 2 lecture material
+vijk <- by(cd4_df, cd4_df$ID, function(df) {
+  v <- outer(df$resid, df$resid, 
+             function(x, y) 0.5*(x-y)^2)
+  v[lower.tri(v)]
+})
+uijk <- by(cd4_df, cd4_df$ID, function(df) {
+  u <- outer(df$Time, df$Time,
+             function(x, y) abs(x - y))
+  u[lower.tri(u)]
+})
+uijk <- unlist(uijk)
+vijk <- unlist(vijk)
+
+vu.lowess <- lowess(uijk, vijk)
+sigma2 <- var(cd4_df$resid)
+
+plot(uijk, vijk, col = "gray50", pch = 18, cex = 0.4,
+     xlim = c(0, 6), ylim = c(0, 50),
+     xlab = "Lag", ylab = "Half squared differences")
+lines(vu.lowess, col = "red", lwd = 2)
+abline(h = sigma2, lty = 2)
+```
+
+Table 2: **Variances of the residuals** from the simple spline fit above.
+
+```{r message=FALSE, results='asis'}
+cd4.wide <- suppressWarnings(reshape(as.data.frame(cd4_df)[,c("ID", "resid", "yr")], 
+                    direction = "wide", v.names = "resid",
+                    timevar = "yr", idvar = "ID"))
+cv.cd4.wide <- cov(cd4.wide[,-1], use="pairwise.complete.obs")
+cd4.resids.vars <- diag(cv.cd4.wide)
+# re-order 
+cd4.resids.vars <- c(cd4.resids.vars[3:4], cd4.resids.vars[1:2], cd4.resids.vars[5:9])
+cd4.resids.vars.df <- as.data.frame(cd4.resids.vars)
+names(cd4.resids.vars.df) <- c('Variances')
+kable(t(cd4.resids.vars.df), caption="Variances of Residuals", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+And the full variance-covariance matrix:
+```{r message=FALSE, results='markup'}
+cv.cd4.wide
+```
+And the full correlation matrix:
+```{r message=FALSE, results='markup'}
+cov2cor(cv.cd4.wide)
+```
+
+**Response Variable Distribution**:
+
+```{r message=FALSE, results='asis', out.width = '65%', out.height = '65%'}
+pal <- c('red', 'steelblue', 'green', 'orange', 'purple', 'blue', 'tomato1', 'darkgreen', 'black')
+
+plt.res.dens <- ggplot(cd4_df)+
+  geom_density(aes(CD4sqrt), colour='steelblue')+
+  ggtitle('Response Density') + ylab('Density')
+
+plt.res.qq <- ggplot(cd4_df)+
+  geom_qq(aes(sample=CD4sqrt))+
+  xlab('Theoretical Quantiles')+
+  ylab('Sample Quantiles')+
+  ggtitle('Normal Q-Q Plot')
+  
+plt.res.dens.yr <- ggplot(cd4_df)+
+  geom_density(aes(CD4sqrt, group=yr.f, colour=yr.f))+
+  ggtitle('Response Density per Year') + ylab('Density') +
+  scale_color_manual(name='Years', values = pal)
+
+grid.arrange(plt.res.dens, plt.res.qq, ncol=2)
+plt.res.dens.yr
+```
+
+**Time Trends for covariates : population and sample**
+
+```{r out.width = '65%', out.height = '65%'}
+covariate_trend <- function(df, title, variable, colours=c('lightblue', 'steelblue', 'black')){
+  g <- ggplot(df)+
+    geom_line(aes_string(x = 'yr', y=variable, group='ID'), colour=colours[1])+
+    geom_smooth(aes_string(x = 'yr', y=variable), colour=colours[2], se = F, method='loess', span=0.75)+
+    ggtitle(title) + xlab('Time (Years)') +
+    geom_vline(xintercept = 0, colour=colours[3], lty=5)
+  return(g)
+}
+# partners
+covariate_trend(cd4_df, 'Number of Sexual Partners', 'Sex')
+covariate_trend(sample_df, 'Number of Sexual Partners (Sample)', 'Sex')
+# depression score
+covariate_trend(cd4_df, 'CESD Depression Score', 'Cesd')
+covariate_trend(sample_df, 'CESD Depression Score (Sample)', 'Cesd')
+# drug use
+covariate_trend(cd4_df, 'Drug Use', 'Drugs')
+covariate_trend(sample_df, 'Drug Use (Sample)', 'Drugs')
+# smoking
+covariate_trend(cd4_df, 'Packs per Day', 'Packs')
+covariate_trend(sample_df, 'Packs per Day (Sample)', 'Packs')
+```
+
+**Covariates and the evolution of the response over time**
+
+Not all of combinations of these plots were included in the main report due to space limitations.
+
+```{r out.width = '65%', out.height = '65%'}
+covariate_response_profile <- function(df1, df2, title, labels, colours=c('red', 'steelblue')){
+  g <- ggplot()+
+    geom_smooth(data=df1, aes(x=yr, y=CD4sqrt, colour=colours[1]), se = F, method='loess', span=0.75)+
+    geom_smooth(data=df2, aes(x=yr, y=CD4sqrt, colour=colours[2]), se = F, method='loess', span=0.75)+
+    scale_colour_manual(values=colours, labels=labels)+
+    scale_y_continuous(breaks = seq(20, 40, 5))+
+    ggtitle(title) + xlab(NULL) + ylab(NULL) +
+    theme(legend.title = element_blank(), legend.position = 'bottom')
+  return(g)
+}
+# Smoker
+covariate_response_profile(cd4_df %>% filter(smoker == T), 
+                           cd4_df %>% filter(smoker == F), 
+                           'Smoking Status', c('Smoker', 'Non-smoker'))
+# drug use
+covariate_response_profile(cd4_df %>% filter(Drugs == 1), 
+                           cd4_df %>% filter(Drugs == 0), 
+                           'Drug Use', c('Drug use', 'No drug use'))
+# age upper/lower quartiles
+covariate_response_profile(cd4_df %>% filter(Age >= quantile(Age, 0.75)), 
+                           cd4_df %>% filter(Age <= quantile(Age, 0.25)), 
+                           'Age', c('Upper quartile', 'Lower quartile'))
+# depression scores upper/lower quartiles
+covariate_response_profile(cd4_df %>% filter(Cesd >= quantile(Cesd, 0.75)), 
+                           cd4_df %>% filter(Cesd <= quantile(Cesd, 0.25)), 
+                           'CESD Depression Score', c('Upper quartile', 'Lower quartile'))
+# sex partners upper/lower quartiles
+covariate_response_profile(cd4_df %>% filter(Sex >= quantile(Sex, 0.75)), 
+                           cd4_df %>% filter(Sex <= quantile(Sex, 0.25)), 
+                           'Number of Partners', c('Upper quartile', 'Lower quartile'))
+```
+
+**Separating Cross-sectional vs Longitudinal Effects**
+
+Plot covariate changes w.r.t baseline 
+
+```{r message=FALSE, warning=FALSE, out.width = '65%', out.height = '65%'}
+baseline_ids <- cd4_df %>% filter(yr == 0) %>% select(ID) %>% distinct()
+# there are 307 subjects with measurements at baseline
+
+# data frame of baseline values for each covariate
+baseline_df <- cd4_df %>% filter(ID %in% baseline_ids$ID & yr == 0) %>% 
+  group_by(ID) %>% 
+  top_n(n = 1, wt = -quarter) %>% 
+  arrange(ID) %>% 
+  mutate(
+    CD4sqrti = CD4sqrt,
+    Agei = Age,
+    Cesdi = Cesd,
+    Packsi = Packs,
+    Drugsi = Drugs,
+    Sexi = Sex
+  ) %>% 
+  select(ID, CD4sqrti, Agei, Cesdi, Packsi, Drugsi, Sexi)
+
+cd4_base_lines_df <- cd4_df %>% filter(ID %in% baseline_ids$ID& yr >= 0) %>% 
+  inner_join(baseline_df)
+
+cross_trend_baseline <- function(df, variable, xlabel, span=0.75){
+  g <- ggplot(baseline_df)+
+    geom_point(aes_string(x = variable, y = 'CD4sqrti'), alpha=0.75)+
+    geom_smooth(aes_string(x = variable, y = 'CD4sqrti'), color='steelblue', se = F, method='loess', span=span)+
+    xlab(xlabel) + ylab('Baseline CD4sqrt')
+  return(g)
+}
+
+long_trend_baseline <- function(df, variable, xlabel, span=0.75){
+  g <- ggplot(df)+
+    geom_point(aes_string(x = variable, y = 'CD4sqrt - CD4sqrti'), alpha=0.75)+
+    geom_smooth(aes_string(x = variable, y = 'CD4sqrt - CD4sqrti'), color='steelblue', se = F, method='loess', span=span)+
+    xlab(xlabel) + ylab('Change in CD4sqrt')
+  return(g)
+}
+
+# CESD
+cross_trend_baseline(baseline_df, 'Cesdi', 'Baseline CESD')
+long_trend_baseline(cd4_base_lines_df, 'Cesd - Cesdi', 'Change in CESD')
+
+# Packs
+cross_trend_baseline(baseline_df, 'Packsi', 'Baseline Packs')
+long_trend_baseline(cd4_base_lines_df, 'Packs - Packsi', 'Change in Packs', span=0.95)
+
+# Age
+cross_trend_baseline(baseline_df, 'Agei', 'Baseline Age')
+long_trend_baseline(cd4_base_lines_df, 'Age - Agei', 'Change in Age')
+
+# Drugs
+cross_trend_baseline(baseline_df, 'Drugsi', 'Baseline Drugs', span=0.95)
+long_trend_baseline(cd4_base_lines_df, 'Drugs - Drugsi', 'Change in Drugs', span=0.95)
+
+# Sex
+cross_trend_baseline(baseline_df, 'Sexi', 'Baseline Number of Partners')
+long_trend_baseline(cd4_base_lines_df, 'Sex - Sexi', 'Change in Number of Partners')
+```
+Use rounding to nearest year to avoid unbalanced issues and look at correlation plot:
+```{r message=FALSE, warning=FALSE, out.width = '65%', out.height = '65%'}
+panel.cor <- function(x, y, digits=2, prefix="", cex.cor){
+  usr <- par("usr"); on.exit(par(usr))
+  par(usr = c(0, 1, 0, 1))
+  r <- abs(cor(x, y,use="pairwise.complete.obs"))
+  txt <- format(c(r, 0.123456789), digits=digits)[1]
+  txt <- paste(prefix, txt, sep="")
+  if(missing(cex.cor)) cex <- 0.8/strwidth(txt)
+  text(0.5, 0.5, txt, cex = cex * r)
+}
+pairs(cd4.wide[,c(5, 2, 3, 6:8)], upper.panel = panel.cor)
+```
+
+# Model Formulation
+
+Initial 2 simple linear fixed effect models:
+
+```{r message=FALSE, warning=FALSE}
+lm.basic1.fit <- lm(CD4sqrt ~ Time + smoker + Age + Drugs + Cesd + Sex, data = cd4_df)
+sum.lm.basic1.fit <- summary(lm.basic1.fit)
+sum.lm.basic1.fit
+```
+```{r message=FALSE, warning=FALSE}
+lm.basic2.smkr.int.fit <- lm(CD4sqrt ~ Time*smoker + Age + Drugs + Cesd + Sex, data = cd4_df)
+sum.lm.basic2.smkr.int.fit <- summary(lm.basic2.smkr.int.fit)
+sum.lm.basic2.smkr.int.fit
+anova(lm.basic1.fit, lm.basic2.smkr.int.fit)
+```
+
+3-knot piecewise linear model:
+```{r message=FALSE, warning=FALSE}
+cd4_df$Time0 <- (cd4_df$Time)*(cd4_df$Time >= 0)
+cd4_df$Time1 <- (cd4_df$Time)*(cd4_df$Time >= 1)
+cd4_df$Time3 <- (cd4_df$Time)*(cd4_df$Time >= 3)
+cd4_df$smoker.Time0 <- cd4_df$Time0 * (cd4_df$smoker == 1)
+cd4_df$smoker.Time1 <- cd4_df$Time1 * (cd4_df$smoker == 1)
+cd4_df$smoker.Time3 <- cd4_df$Time3 * (cd4_df$smoker == 1)
+lm.basic3.3knots.fit <- lm(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                             smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                             Age + Drugs + Cesd + Sex, data = cd4_df)
+sum.lm.basic3.3knots.fit <- summary(lm.basic3.3knots.fit)
+sum.lm.basic3.3knots.fit$coefficients
+```
+```{r message=FALSE, warning=FALSE}
+AIC(lm.basic1.fit, lm.basic2.smkr.int.fit, lm.basic3.3knots.fit)
+```
+
+Plot residuals from 3-knot model
+
+```{r echo=FALSE, results='asis', message=FALSE, out.width = '65%', out.height = '65%' }
+suppressWarnings(plot(lm.basic3.3knots.fit, form = resid(., level = 0) ~ fitted(.), which = 1))
+```
+
+**Covariance Structures**
+
+Table 3 below shows the results of using the piecewise linear model as our 'maximal' model while exploring various candidate covariance structures.
+
+```{r results='asis'}
+# homogeneous variance
+gls.homo.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                    Age + Drugs + Cesd + Sex, data = cd4_df,
+                  correlation = corCompSymm(form = ~ Time | ID))
+# exponential model
+gls.exp.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                     smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                     Age + Drugs + Cesd + Sex, data = cd4_df,
+                   correlation = corExp(form = ~ Time | ID))
+# exponential model with nugget
+gls.exp.nug.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                         smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                         Age + Drugs + Cesd + Sex, data = cd4_df,
+                       correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)))
+# Gaussian model with nugget
+gls.gau.nug.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                         smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                         Age + Drugs + Cesd + Sex, data = cd4_df,
+                       correlation = corGaus(form = ~ Time | ID, nugget=T, value=c(1.5)))
+# Gaussian model with nugget
+gls.gau.nug.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                         smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                         Age + Drugs + Cesd + Sex, data = cd4_df,
+                       correlation = corGaus(form = ~ Time | ID, nugget=T, value=c(1.5)))
+
+# accrue
+variance.models <- c('Compound symmetry', 'Exponential Decay', 'Exponential Decay', 'Gaussian Decay', 'Gaussian Decay')
+nugget.eff <- c(NA, 'No', 'Yes', 'No', 'Yes')
+aics <- c(14444.61, 14454.11, 14264.99, 14863.40, 14277.90)
+
+cov.struct.df <- tibble(
+  Variance.Model = variance.models,
+  Nugget = nugget.eff,
+  AIC = aics
+)
+kable(cov.struct.df, caption="Covariance Structures Summary", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+Likelihood ratio tests performed against the compound symmetry model for both exponential and Gaussian models.
+
+```{r results='markup'}
+anova(gls.homo.fit, gls.exp.nug.fit)
+```
+```{r results='markup'}
+anova(gls.homo.fit, gls.gau.nug.fit)
+```
+
+The next step is to refit this model using maximum likelihood and re-assess the fixed effects currently in this model through a sequence of drop-refit cycles. 
+
+```{r}
+gls.exp.nug.fit.ml <- update(gls.exp.nug.fit, method='ML')
+
+# drop Age and refit
+gls.exp1.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 +
+                         smoker.Time0 + smoker.Time1 + smoker.Time3 + Drugs + Cesd + Sex,
+                       correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                       data = cd4_df, method='ML')
+sum.gls.exp1.nug.fit.ml <- summary(gls.exp1.nug.fit.ml)
+anova(gls.exp.nug.fit.ml, gls.exp1.nug.fit.ml)
+sum.gls.exp1.nug.fit.ml$tTable
+gls.exp4.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 +
+                          Drugs + Cesd + Sex,
+                           correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                           data = cd4_df, method='ML')
+# take out smoker.Time0
+gls.exp2.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 +
+                             smoker.Time1 + smoker.Time3 +
+                             Drugs + Cesd + Sex,
+                           correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                           data = cd4_df, method='ML')
+anova(gls.exp1.nug.fit.ml, gls.exp2.nug.fit.ml)
+summary(gls.exp2.nug.fit.ml)
+# take out smoker.Time1
+gls.exp3.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 +
+                             smoker.Time3 +
+                             Drugs + Cesd + Sex,
+                           correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                           data = cd4_df, method='ML')
+anova(gls.exp2.nug.fit.ml, gls.exp3.nug.fit.ml)
+summary(gls.exp3.nug.fit.ml)
+# take out smoker.Time3
+gls.exp4.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 +
+                          Drugs + Cesd + Sex,
+                           correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                           data = cd4_df, method='ML')
+anova(gls.exp3.nug.fit.ml, gls.exp4.nug.fit.ml)
+summary(gls.exp4.nug.fit.ml)
+```
+
+Table 4 shows the model fit improvements made at each step when this is done.
+
+```{r results='asis'}
+removed.var <- c('Refit by ML', 'Remove Age', 'Remove smoker.Time0', 'Remove smoker.Time1', 'Remove smoker.Time3')
+removed.aics <- c(14239.49, 14237.69, 14235.75, 14235.28, 14237.96)
+fixed.ml.refit.df <- tibble(
+  Action = removed.var,
+  AIC = removed.aics
+)
+kable(fixed.ml.refit.df, caption="Fixed Effects Simplification Steps", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+Final GLS model:
+
+```{r}
+gls.exp.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + Drugs + Cesd + Sex,
+                   correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)), data = cd4_df)
+AIC(gls.exp.fit)
+```
+
+**Random Effects**
+
+Intercept Only:
+
+```{r cache=TRUE}
+me.exp.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    Drugs + Cesd + Sex, data = cd4_df, 
+                  random = ~ 1 | ID,
+                  correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                  control = lmeControl(opt = 'optim', maxIter = 200))
+summary(me.exp.fit)
+```
+
+Intercept and Slope
+
+```{r cache=TRUE}
+me.exp2.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    Drugs + Cesd + Sex, data = cd4_df, 
+                  random = ~ Time | ID,
+                  correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                  control = lmeControl(opt = 'optim', maxIter = 200))
+summary(me.exp2.fit)
+```
+
+Intercept, Slope and additional slope effects for each piecewise segment:
+
+```{r cache=TRUE}
+me.exp3.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                     Drugs + Cesd + Sex, data = cd4_df,
+                   random = ~ Time + Time0 + Time1 + Time3 | ID,
+                   correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                   control = lmeControl(opt = 'optim', maxIter = 200))
+```
+
+```{r}
+AIC(me.exp.fit, me.exp2.fit, me.exp3.fit)
+```
+
+Drop Drugs covariate for final model
+
+```{r cache=TRUE}
+me.exp4.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    Cesd + Sex, data = cd4_df, 
+                  random = ~ Time | ID,
+                  correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                  control = lmeControl(opt = 'optim', maxIter = 200))
+summary(me.exp4.fit)
+AIC(me.exp4.fit)
+```
+
+**Diagnostic Plots**
+
+A residual plot, a variogram and an ACF for the residuals from this final model are shown below
+
+```{r out.height='50%', out.width='50%'}
+par(mfrow=c(1,2))
+plot(me.exp4.fit, form = resid(., level = 0) ~ fitted(.))
+me.exp4.fit.variogram <- Variogram(me.exp4.fit, form = ~ Time | ID, nint = 100, robust = T)
+plot(me.exp4.fit.variogram)
+plot(ACF(me.exp4.fit))
+par(mfrow=c(1,2))
+qqnorm(me.exp4.fit, ~ resid(., type = "p"), abline = c(0, 1))
+qqnorm(me.exp4.fit, ~ ranef(.))
+```
+
+**Final Model Fixed Effects**
+
+```{r}
+sum.me.exp4.fit <- summary(me.exp4.fit)
+round(sum.me.exp4.fit$tTable, digits = 4)
+```
+
+**Components of Variability**
+
+```{r}
+sigma.b <- 3.870145 # (Intercept StdDev)
+sigma.squ.b <- sigma.b^2 # 14.97802
+sigma.squ.U.and.e <- 4.101988^2 # = 16.82631 (squared res std dev) 
+nugget <- 0.5739228
+sigma.squ.e <- nugget * sigma.squ.U.and.e # 9.657003
+sigma.squ.U <- sigma.squ.U.and.e - sigma.squ.e # = 7.169307
+```
+
+# Application to Individual Trajectories
+
+**Subject 30119**
+
+```{r results='asis'}
+idx.30119 <- which(unique(cd4_df$ID) == 30119)
+var.cov.30119 <- getVarCov(me.exp4.fit, individual=c(idx.30119), type="marginal")
+cor.30119 <- cov2cor(var.cov.30119[[1]])
+kable(t(diag(var.cov.30119[[1]])), caption="Estimated Variances for Subject 30119", escape = F, digits = 2) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+```{r results='asis'}
+kable(t(cor.30119[1,]), caption="Estimated Correlations for Subject 30119", escape = F, digits = 2) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+Full covariance matrix:
+```{r results='markup'}
+var.cov.30119
+```
+Full correlation matrix:
+```{r results='markup'}
+cor.30119
+```
+
+**BLUPs for Five**
+
+```{r message=FALSE, warning=FALSE}
+# get subject ids with 7 or more observations
+sub.ids.7.plus <- cd4_df %>% group_by(ID) %>% summarise(num_obs = max(obsnum)) %>% 
+  filter(num_obs >= 7) %>% arrange(ID, num_obs) %>% select(ID)
+cd4_7_df <- cd4_df %>% filter(ID %in% sub.ids.7.plus$ID)
+target_sids <- c(30119, 40286, 20777, 10213, 10453)
+target_df <- cd4_7_df %>% filter(ID %in% target_sids)
+# build covariate matrix for selected subjects
+X_df <- target_df %>% 
+  mutate(Intercept = rep(1, n())) %>% 
+  select(Intercept, Time, smoker, Time0, Time1, Time3, Cesd, Sex) %>% 
+  mutate(
+    Time.Smoker = Time * smoker
+  )
+
+# define a method that returns a data frame containing the empirical BLUP for a subject
+calculate_blup <- function(subjectId, df, mdl.fit){
+  # extract subject design matrix
+  X.sub <- as.matrix(df %>% ungroup() %>% filter(ID == subjectId) %>% select(-ID))
+  # calculate fixed effects
+  fe.sub <- X.sub %*% mdl.fit$coefficients$fixed
+  # calculate random effects 
+  preds.sub <- mdl.fit$coefficients$random$ID[as.character(subjectId),]
+  X.re <- X.sub[,c(1,2)]
+  # do it componentwise and return data frame
+  re.sub <- X.re %*% preds.sub
+  blup.sub <- fe.sub + re.sub
+  blup.df.sub <- tibble(
+    ID = rep(subjectId, length(blup.sub)),
+    Time = X.re[,2],
+    Blup = blup.sub[,1]
+  )
+  return(blup.df.sub)
+}
+
+# apply to selected subjects
+blup_df.30119 <- calculate_blup(30119, X_df, me.exp4.fit)
+blup_df.40286 <- calculate_blup(40286, X_df, me.exp4.fit)
+blup_df.20777 <- calculate_blup(20777, X_df, me.exp4.fit)
+blup_df.10213 <- calculate_blup(10213, X_df, me.exp4.fit)
+blup_df.10453 <- calculate_blup(10453, X_df, me.exp4.fit)
+```
+
+**Plot BLUPs**
+
+\footnotesize
+```{r results='asis'}
+ggplot(cd4_df)+
+  ggtitle('Population Average and BLUPs for Selected Subjects')+ xlab('Time (Years)')+ ylab('CD4 Sqrt')+
+  scale_x_continuous(breaks=x)+
+  geom_vline(xintercept = 0, colour='black', lty=5)+
+  annotate("text", label = "Seroconversion time", x = 0.1, y = 50, size = 4, colour = "black", hjust=0)+
+  geom_smooth(aes(x=yr, y=CD4sqrt), colour='red', se = F, method='loess', span=0.75)+
+  # 30119
+  geom_point(data=target_df %>% filter(ID == 30119), aes(x=yr, y=CD4sqrt), color='blue', shape=3)+
+  geom_line(data=blup_df.30119, aes(x=Time, y=Blup), color='blue', lwd=1)+
+  annotate("text", label = "30119", x = blup_df.30119[1,]$Time, y = blup_df.30119[1,]$Blup, size = 5, colour = "blue", hjust=0, vjust=-1)+
+
+  # 20777
+  geom_point(data=target_df %>% filter(ID == 20777), aes(x=yr, y=CD4sqrt), color='darkorange', shape=3)+
+  geom_line(data=blup_df.20777, aes(x=Time, y=Blup), color='darkorange', lwd=1)+
+  annotate("text", label = "20777", x = blup_df.20777[1,]$Time, y = blup_df.20777[1,]$Blup, size = 5, colour = "darkorange", hjust=0, vjust=-1)+
+
+  # 40286
+  geom_point(data=target_df %>% filter(ID == 40286), aes(x=yr, y=CD4sqrt), color='darkgreen', shape=3)+
+  geom_line(data=blup_df.40286, aes(x=Time, y=Blup), color='darkgreen', lwd=1)+
+  annotate("text", label = "40286", x = blup_df.40286[1,]$Time, y = blup_df.40286[1,]$Blup, size = 5, colour = "darkgreen", hjust=0, vjust=-1)+
+
+  # 10213
+  geom_point(data=target_df %>% filter(ID == 10213), aes(x=yr, y=CD4sqrt), color='steelblue', shape=3)+
+  geom_line(data=blup_df.10213, aes(x=Time, y=Blup), color='steelblue', lwd=1)+
+  annotate("text", label = "10213", x = blup_df.10213[1,]$Time, y = blup_df.10213[1,]$Blup, size = 5, colour = "steelblue", hjust=0, vjust=-1)+
+
+  # 10453
+  geom_point(data=target_df %>% filter(ID == 10453), aes(x=yr, y=CD4sqrt), color='black', shape=3)+
+  geom_line(data=blup_df.10453, aes(x=Time, y=Blup), color='black', lwd=1)+
+  annotate("text", label = "10453", x = blup_df.10453[1,]$Time, y = blup_df.10453[1,]$Blup, size = 5, colour = "black", hjust=0, vjust=-1)
+
+```

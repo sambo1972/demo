@@ -1,0 +1,691 @@
+---
+header-includes:
+- \usepackage{lipsum}
+- \usepackage{amsmath}
+- \usepackage{bbm}
+- \usepackage{amssymb}
+- \usepackage[normalem]{ulem}
+- \usepackage{pgfplots}
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyhead[LE, LO]{}
+- \fancyhead[CE, CO]{}
+- \fancyhead[RE, RO]{Sam Mason (1058231)}
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE, message=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center', out.width = '75%', out.height = '75%')
+
+library(knitr)
+library(tinytex)
+library(kableExtra)
+library(latex2exp)
+library(tidyverse)
+library(gridExtra)
+library(nlme)
+library(lmtest)
+library(splines)
+```
+
+```{r include=FALSE}
+cd4_df <- read.table("cd4data.txt", header = TRUE)
+cd4_df <- cd4_df %>% 
+  mutate(
+    CD4sqrt = CD4^0.5,
+    yr = round(Time),
+    yr.f = factor(yr, levels=c(-3,-2,-1,0,1,2,3,4,5)),
+    quarter = round(4*Time)/4,
+    smoker = ifelse(Packs > 0, 1, 0)
+  ) %>% 
+  arrange(ID, Time) %>% 
+  group_by(ID) %>% 
+  mutate(
+    obsnum = 1:n()
+  )
+```
+**Introduction**
+
+This report summarises the findings of a brief investigation into a small sample of the Multicenter AIDS Cohort Study dataset. It is known that HIV destroys CD4 cells as the disease progresses and the aim of this project was to attempt to develop a feasible model relating the evolution over time of CD4 cell counts as a function of a number of other pre-specified covariates.
+
+The dataset consists of longitudinally collected observations on 369 subjects, resulting in a total of
+2376 observations of CD4 cell counts. The covariates include time, subject age, cigarette use, CESD score (a depression indicator), drug use and sexual activity. A detailed data dictionary was supplied with this project specification and is included in the appendix document.
+
+Note that this is simply an exercise in modelling the transformed (square root) response variable with respect to these covariates and it is not the intention of this work to imply any causality. 
+
+**Exploratory Data Analysis**
+
+Table 1 below shows the variation of subjects and observations over the course of the study and we note a significant drop off by lag 5. Thus we need to be careful interpreting any mean response trends at high lags and use robust techniques when assessing trends. There is a lot of missing data and the dataset is highly unbalanced.
+
+```{r echo=FALSE, message=FALSE, results='asis'}
+# look at how subjects and obs varied over the course of the study
+# observations per year over study
+obs_per_year_df <- cd4_df %>% group_by(yr) %>% summarise(obs_cnt=n())
+# subjects per year over study
+subs_per_year_df <- cd4_df %>% select(yr, ID) %>% distinct %>% group_by(yr) %>% summarise(sub_cnt=n())
+
+sub_obs_df <- tibble(
+  Year = obs_per_year_df$yr,
+  Num.Observations = obs_per_year_df$obs_cnt,
+  Num.Subjects = subs_per_year_df$sub_cnt 
+)
+kable(t(sub_obs_df), caption="Study Observations Profile", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+Inspection of the mean response profiles shows a slight increase in CD4 cell levels just prior to seroconversion followed by an overall decrease with time post-baseline. This rate of decrease appears to be quite steep over the first year, followed by a slower decline from years one to three and flattening out to a shallow decrease rate thereafter. There is some visual evidence of a possible rise in mean response at year five consistent with less observations at these higher lags as subjects become lost to follow up.
+
+```{r echo=F, message=F, warning=FALSE, out.width = '65%', out.height = '65%'}
+# plot all response curves over time : build a dataframe for the means at each time point
+x <- sort(unique(cd4_df$yr))
+means_df <- cd4_df %>% 
+  select(yr, CD4sqrt) %>% 
+  group_by(yr) %>% 
+  summarise(mean_response = mean(CD4sqrt)) %>% 
+  arrange(yr)
+
+y_lim = c(floor(min(cd4_df$CD4sqrt)), ceiling(max(cd4_df$CD4sqrt)))
+y_scale <- seq(floor(min(cd4_df$CD4sqrt)), ceiling(max(cd4_df$CD4sqrt)))
+
+plt.mr.pop <- ggplot(cd4_df)+
+  geom_line(aes(x=yr, y=CD4sqrt, group=ID), color='lightblue')+
+  geom_point(aes(x=yr, y=CD4sqrt, group=ID), shape=1, color='lightblue')+
+  #ggtitle('Time Plot for CD4 Sqrt Levels')+ 
+  xlab('Time (Years)')+ ylab('CD4 Sqrt')+
+  scale_x_continuous(breaks=x)+
+  geom_vline(xintercept = 0, colour='black', lty=5)+
+  annotate("text", label = "Seroconversion time", x = 0.1, y = 55, size = 5, colour = "black", hjust=0)+
+  geom_line(data = means_df, aes(x=yr, y=mean_response, colour='red'), lwd=1)+
+  geom_smooth(aes(x=yr, y=CD4sqrt, colour='darkgreen'), se = F, method='loess', span=0.75)+
+  geom_smooth(aes(x=yr, y=CD4sqrt, colour='steelblue'), se = F, method='glm')+
+  scale_colour_manual(values=c('red', 'darkgreen', 'steelblue'), 
+                      labels=c('Mean response', 'Lowess', 'Least squares'))+
+  theme(legend.title = element_blank())
+
+plt.mr.pop
+```
+While there is a significant amount of missing data in this study, between-individual heterogeneity is still evident as subjects with higher CD4 levels tend to remain above average while those with low cell counts tend to remain below the overall average. Within-subject variation appears somewhat random but post-baseline, there is some evidence of persistent serial correlation. A time plot for a selected random sample of subjects is shown below where the population mean response curve is shown in red. In this plot the within-subject variability and between subject heterogeneity is much clearer. 
+
+```{r echo=F, message=F, out.width = '65%', out.height = '65%'}
+# these were randomly generated originally
+sample_sids <- c(20439,41829,41844,30693,40942,30820,20777,40286, 30489,30075,30827,20205,41566,21083,41253,10302,40807,30835,20768,41194)
+
+sample_df <- cd4_df %>% filter(ID %in% sample_sids)
+
+plt.mr.sam <- ggplot(sample_df)+
+  geom_line(aes(x=yr, y=CD4sqrt, group=ID), color=sample_df$ID)+
+  geom_point(aes(x=yr, y=CD4sqrt, group=ID), shape=1, color=sample_df$ID)+
+  scale_x_continuous(breaks=x)+
+  geom_vline(xintercept = 0, colour='black', lty=5)+
+  annotate("text", label = "Seroconversion time", x = 0.1, y = 55, size = 5, colour = "black", hjust=0)+
+  xlab('Time (Years)')+ ylab('CD4 Sqrt')+
+  geom_line(data = means_df, aes(x=yr, y=mean_response), colour='red', lwd=1)+
+  theme(legend.title = element_blank())
+plt.mr.sam
+```
+To attempt to get a feel for the correlation in this data we can plot a sample variogram of the residuals from a simple spline fit and we see some evidence of persistent serial correlation even at large lags that appears to be decaying fairly slowly.  
+\footnotesize
+```{r message=FALSE}
+cd4_df$resid <- resid(smooth.spline(cd4_df$yr, cd4_df$CD4sqrt))
+```
+```{r echo=FALSE}
+# sample variogram from week 2 lecture material
+vijk <- by(cd4_df, cd4_df$ID, function(df) {
+  v <- outer(df$resid, df$resid, 
+             function(x, y) 0.5*(x-y)^2)
+  v[lower.tri(v)]
+})
+uijk <- by(cd4_df, cd4_df$ID, function(df) {
+  u <- outer(df$Time, df$Time,
+             function(x, y) abs(x - y))
+  u[lower.tri(u)]
+})
+uijk <- unlist(uijk)
+vijk <- unlist(vijk)
+
+vu.lowess <- lowess(uijk, vijk)
+sigma2 <- var(cd4_df$resid)
+
+plot(uijk, vijk, col = "gray50", pch = 18, cex = 0.4,
+     xlim = c(0, 6), ylim = c(0, 50),
+     xlab = "Lag", ylab = "Half squared differences")
+lines(vu.lowess, col = "red", lwd = 2)
+abline(h = sigma2, lty = 2)
+```
+\normalsize
+As can be seen in both the variogram above and the variances of the residuals in Table 2 below, the variance is not really constant and exhibits a general increase with lag. The correlation is persistent and exhibits very slow decay - almost constant with higher values out at large lags where there is much less data. The full correlation matrix is available in the appendix document.
+
+\footnotesize
+```{r echo=FALSE, message=FALSE, results='asis'}
+cd4.wide <- suppressWarnings(reshape(as.data.frame(cd4_df)[,c("ID", "resid", "yr")], 
+                    direction = "wide", v.names = "resid",
+                    timevar = "yr", idvar = "ID"))
+cv.cd4.wide <- cov(cd4.wide[,-1], use="pairwise.complete.obs")
+cd4.resids.vars <- diag(cv.cd4.wide)
+# re-order 
+cd4.resids.vars <- c(cd4.resids.vars[3:4], cd4.resids.vars[1:2], cd4.resids.vars[5:9])
+cd4.resids.vars.df <- as.data.frame(cd4.resids.vars)
+names(cd4.resids.vars.df) <- c('Variances')
+kable(t(cd4.resids.vars.df), caption="Variances of Residuals", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+\normalsize
+As has been shown in supplied work (CD4InitialAnalysis.R), the distribution of the response variable (the sqrt of CD4 cell counts) is approximately normal. Here we confirm this and also confirm that this holds roughly true for each year in the study and that therefore we can assume normality of residuals when modelling.
+
+```{r echo=FALSE, message=FALSE, results='asis', out.width = '65%', out.height = '65%'}
+pal <- c('red', 'steelblue', 'green', 'orange', 'purple', 'blue', 'tomato1', 'darkgreen', 'black')
+
+plt.res.dens <- ggplot(cd4_df)+
+  geom_density(aes(CD4sqrt), colour='steelblue')+
+  ggtitle('Response Density') + ylab('Density')
+
+plt.res.qq <- ggplot(cd4_df)+
+  geom_qq(aes(sample=CD4sqrt))+
+  xlab('Theoretical Quantiles')+
+  ylab('Sample Quantiles')+
+  ggtitle('Normal Q-Q Plot')
+  
+plt.res.dens.yr <- ggplot(cd4_df)+
+  geom_density(aes(CD4sqrt, group=yr.f, colour=yr.f))+
+  ggtitle('Response Density per Year') + ylab('Density') +
+  scale_color_manual(name='Years', values = pal)
+
+grid.arrange(plt.res.dens, plt.res.qq, ncol=2)
+plt.res.dens.yr
+```
+Next, we explore the relationship between four key covariates and the evolution of the response over time. To start with, note that the 'Packs' covariate has been used to group subjects into 'Smokers' and 'Non-Smokers' (zero Packs per day). As seen below there appears to be a fairly consistent group effect across time for Smokers/Non-Smokers as well as for recreational drug use.
+```{r echo=FALSE, out.width = '65%', out.height = '65%'}
+covariate_response_profile <- function(df1, df2, title, labels, colours=c('red', 'steelblue')){
+  g <- ggplot()+
+    geom_smooth(data=df1, aes(x=yr, y=CD4sqrt, colour=colours[1]), se = F, method='loess', span=0.75)+
+    geom_smooth(data=df2, aes(x=yr, y=CD4sqrt, colour=colours[2]), se = F, method='loess', span=0.75)+
+    scale_colour_manual(values=colours, labels=labels)+
+    scale_y_continuous(breaks = seq(20, 40, 5))+
+    ggtitle(title) + xlab(NULL) + ylab(NULL) +
+    theme(legend.title = element_blank(), legend.position = 'bottom')
+  return(g)
+}
+# Smoker
+plt_cov_response_smoker <- covariate_response_profile(cd4_df %>% filter(smoker == T), 
+                                                      cd4_df %>% filter(smoker == F), 
+                                                      'Smoking Status', c('Smoker', 'Non-smoker'))
+# drug use
+plt_cov_response_drugs <- covariate_response_profile(cd4_df %>% filter(Drugs == 1), 
+                                                     cd4_df %>% filter(Drugs == 0), 
+                                                     'Drug Use', c('Drug use', 'No drug use'))
+grid.arrange(plt_cov_response_smoker, plt_cov_response_drugs, ncol=2)
+```
+For CESD depression scores, there does not appear to be any cross-sectional effect but we might expect depression scores to be associated with a decrease in CD4 counts longitudinally:
+```{r echo=FALSE, message=FALSE, out.width = '75%', out.height = '75%'}
+baseline_ids <- cd4_df %>% filter(yr == 0) %>% select(ID) %>% distinct()
+# there are 307 subjects with measurements at baseline
+
+# data frame of baseline values for each covariate
+baseline_df <- cd4_df %>% filter(ID %in% baseline_ids$ID & yr == 0) %>% 
+  group_by(ID) %>% 
+  top_n(n = 1, wt = -quarter) %>% 
+  arrange(ID) %>% 
+  mutate(
+    CD4sqrti = CD4sqrt,
+    Agei = Age,
+    Cesdi = Cesd,
+    Packsi = Packs,
+    Drugsi = Drugs,
+    Sexi = Sex
+  ) %>% 
+  select(ID, CD4sqrti, Agei, Cesdi, Packsi, Drugsi, Sexi)
+
+cd4_base_lines_df <- cd4_df %>% filter(ID %in% baseline_ids$ID& yr >= 0) %>% 
+  inner_join(baseline_df)
+
+cross_trend_baseline <- function(df, variable, xlabel, span=0.75){
+  g <- ggplot(baseline_df)+
+    geom_point(aes_string(x = variable, y = 'CD4sqrti'), alpha=0.75)+
+    geom_smooth(aes_string(x = variable, y = 'CD4sqrti'), color='steelblue', se = F, method='loess', span=span)+
+    xlab(xlabel) + ylab('Baseline CD4sqrt')
+  return(g)
+}
+
+long_trend_baseline <- function(df, variable, xlabel, span=0.75){
+  g <- ggplot(df)+
+    geom_point(aes_string(x = variable, y = 'CD4sqrt - CD4sqrti'), alpha=0.75)+
+    geom_smooth(aes_string(x = variable, y = 'CD4sqrt - CD4sqrti'), color='steelblue', se = F, method='loess', span=span)+
+    xlab(xlabel) + ylab('Change in CD4sqrt')
+  return(g)
+}
+
+# depression scores upper/lower quartiles
+plt_cov_response_dep <- covariate_response_profile(cd4_df %>% filter(Cesd >= quantile(Cesd, 0.75)), 
+                                                   cd4_df %>% filter(Cesd <= quantile(Cesd, 0.25)), 
+                                                   'Depression Score', c('Upper quartile', 'Lower quartile'))
+plt_cov_cross_dep <- cross_trend_baseline(baseline_df, 'Cesdi', 'Baseline CESD')
+plt_cov_long_dep <- long_trend_baseline(cd4_base_lines_df, 'Cesd - Cesdi', 'Change in CESD')
+
+grid.arrange(plt_cov_response_dep, plt_cov_cross_dep, plt_cov_long_dep, ncol=3)
+```
+For number of sexual partners, there does not appear to be any cross-sectional effect. There is some longitudinal effect but it is difficult to interpret given that this covariate has been centered:
+```{r echo=FALSE, message=FALSE, out.width = '75%', out.height = '75%'}
+# sex partners upper/lower quartiles
+plt_cov_response_sex <- covariate_response_profile(cd4_df %>% filter(Sex >= quantile(Sex, 0.75)),
+                                                   cd4_df %>% filter(Sex <= quantile(Sex, 0.25)),
+                                                   'Number of Sexual Partners', c('Upper quartile', 'Lower quartile'))
+plt_cov_cross_sex <- cross_trend_baseline(baseline_df, 'Sexi', 'Baseline Num. Partners')
+plt_cov_long_sex <- long_trend_baseline(cd4_base_lines_df, 'Sex - Sexi', 'Change in Num. Partners')
+
+grid.arrange(plt_cov_response_sex, plt_cov_cross_sex, plt_cov_long_sex, ncol=3)
+```
+Similar plots and analysis for other covariates are detailed in the appendix document. 
+
+**Model Formulation**
+
+The EDA process has resulted in a number of findings/indicators regarding approaches to modelling:
+
+* CD4 cell counts exhibit three key changes in rate of decrease from seroconversion at times t=0, t=1 and t=3 years. This suggests a linear piecewise model with knots at these locations might be effective. 
+* The unbalanced nature of the data limits the covariance structures we can consider to account for serial correlation - specifically, the persistent correlation and slow decay over time suggests parametric representations such as exponential or Gaussian to model this.
+* The large range of subject responses (i.e. between subject heterogeneity) suggests considering random effects for subject-specific intercepts and possibly for each slope segment in a piecewise model due to the high within-subject variability.
+* As discussed above there is some evidence of a possible group effect for both Smokers vs Non-Smokers as well as Drug Use vs No Drug Use in the relevant stratified mean response profiles.
+* The Smoker group effect (if it exists) appears more pronounced than any group effect relating to drug use.
+
+Based on these, the modelling process proceeds as follows:
+
+* Propose and fit a number of preliminary linear models ignoring correlation to get a sense of coefficients and basic significance.
+* Choose one of these as provisional "maximal" model for the mean and holding that fixed, fit and assess a series of candidate covariance structures.
+* Choose a suitable covariance structure and then re-fit and re-assess variables in the model.
+* Explore random effects for intercepts and slope terms.
+* Finalise model and assess the variability of the response the model is able to represent.
+
+To begin, we fit two simple linear models, ignoring the fact that we have correlated errors and inspect regression coefficients and significances. Note that a full group interaction effect for the Smokers group is modelled here as this is not a randomised controlled trial and therefore there is no reason to assume apriori that these groups have the same intercepts at baseline (and in fact our EDA suggests that they do not).
+
+
+\footnotesize
+```{r}
+lm.basic1.fit <- lm(CD4sqrt ~ Time + smoker + Age + Drugs + Cesd + Sex, data = cd4_df)
+lm.basic2.smkr.int.fit <- lm(CD4sqrt ~ Time*smoker + Age + Drugs + Cesd + Sex, data = cd4_df)
+```
+```{r echo=FALSE}
+sum.lm.basic1.fit <- summary(lm.basic1.fit)
+sum.lm.basic2.smkr.int.fit <- summary(lm.basic2.smkr.int.fit)
+```
+```{r}
+anova(lm.basic1.fit, lm.basic2.smkr.int.fit)
+```
+```{r echo=FALSE, results='markup'}
+#sum.lm.basic2.smkr.int.fit$coefficients
+```
+\normalsize
+The anova test strongly rejects the null hypothesis that the interaction terms are not required. Note that generally speaking the Age and Sex covariates are not significant (p-vals of 0.12 and 0.72) and that there is strong evidence of a group effect for Smokers (p-val 0.0004) which aligns with expectations from EDA. 
+
+The negative sign of the CESD coefficient suggests that increases in depression scores are associated with decreases in CD4 cell counts (as was also suggested in the EDA process). 
+
+The third preliminary model is piecewise linear with knots at times t=0, t=1 and t=3:
+
+\footnotesize
+```{r echo=FALSE}
+cd4_df$Time0 <- (cd4_df$Time)*(cd4_df$Time >= 0)
+cd4_df$Time1 <- (cd4_df$Time)*(cd4_df$Time >= 1)
+cd4_df$Time3 <- (cd4_df$Time)*(cd4_df$Time >= 3)
+cd4_df$smoker.Time0 <- cd4_df$Time0 * (cd4_df$smoker == 1)
+cd4_df$smoker.Time1 <- cd4_df$Time1 * (cd4_df$smoker == 1)
+cd4_df$smoker.Time3 <- cd4_df$Time3 * (cd4_df$smoker == 1)
+```
+```{r}
+lm.basic3.3knots.fit <- lm(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                             smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                             Age + Drugs + Cesd + Sex, data = cd4_df)
+```
+```{r echo=FALSE, results='markup'}
+# sum.lm.basic3.3knots.fit <- summary(lm.basic3.3knots.fit)
+# sum.lm.basic3.3knots.fit$coefficients
+```
+\normalsize
+At this point we have three fixed effects models, all of which ignore correlation, with AIC values of 15368.25, 15357.79 and 15303.75 respectively. In all three models, neither Age nor Sex covariates appear significant. A plot of the residuals for the 3-knot model is shown below and surprisingly shows a fairly good model fit. 
+```{r echo=FALSE, results='asis', message=FALSE, out.width = '65%', out.height = '65%' }
+suppressWarnings(plot(lm.basic3.3knots.fit, form = resid(., level = 0) ~ fitted(.), which = 1))
+```
+Table 3 below shows the results of using the piecewise linear model as our 'maximal' model while exploring various candidate covariance structures.
+```{r echo=FALSE, results='asis'}
+# homogeneous variance
+gls.homo.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                    Age + Drugs + Cesd + Sex, data = cd4_df,
+                  correlation = corCompSymm(form = ~ Time | ID))
+# exponential model
+gls.exp.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                     smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                     Age + Drugs + Cesd + Sex, data = cd4_df,
+                   correlation = corExp(form = ~ Time | ID))
+# exponential model with nugget
+gls.exp.nug.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                         smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                         Age + Drugs + Cesd + Sex, data = cd4_df,
+                       correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)))
+# Gaussian model with nugget
+gls.gau.nug.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                         smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                         Age + Drugs + Cesd + Sex, data = cd4_df,
+                       correlation = corGaus(form = ~ Time | ID, nugget=T, value=c(1.5)))
+# Gaussian model with nugget
+gls.gau.nug.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                         smoker.Time0 + smoker.Time1 + smoker.Time3 +
+                         Age + Drugs + Cesd + Sex, data = cd4_df,
+                       correlation = corGaus(form = ~ Time | ID, nugget=T, value=c(1.5)))
+
+# accrue
+variance.models <- c('Compound symmetry', 'Exponential Decay', 'Exponential Decay', 'Gaussian Decay', 'Gaussian Decay')
+nugget.eff <- c(NA, 'No', 'Yes', 'No', 'Yes')
+aics <- c(14444.61, 14454.11, 14264.99, 14863.40, 14277.90)
+
+cov.struct.df <- tibble(
+  Variance.Model = variance.models,
+  Nugget = nugget.eff,
+  AIC = aics
+)
+kable(cov.struct.df, caption="Covariance Structures Summary", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+\normalsize
+Likelihood ratio tests were performed against the compound symmetry model for both exponential and Gaussian models. In both cases, the test statistics are large (181.6 and 168.7 respectively) with p-values < 0.0001 and thus we can reject the null hypothesis and conclude that we are justified in adopting these simpler covariance structures.
+\footnotesize
+```{r echo=FALSE}
+#anova(gls.homo.fit, gls.exp.nug.fit)
+```
+```{r echo=FALSE}
+#anova(gls.homo.fit, gls.gau.nug.fit)
+```
+\normalsize
+Based on the AIC values in Table 3, we choose the exponential model with a nugget effect for our covariance structure as it has the lowest AIC value (14264.99). 
+
+The next step is to refit this model using maximum likelihood and re-assess the fixed effects currently in this model through a sequence of drop-refit cycles. Table 4 shows the model fit improvements made at each step when this is done.
+
+```{r echo=FALSE, results='asis'}
+removed.var <- c('Refit by ML', 'Remove Age', 'Remove smoker.Time0', 'Remove smoker.Time1', 'Remove smoker.Time3')
+removed.aics <- c(14239.49, 14237.69, 14235.75, 14235.28, 14237.96)
+fixed.ml.refit.df <- tibble(
+  Action = removed.var,
+  AIC = removed.aics
+)
+kable(fixed.ml.refit.df, caption="Fixed Effects Simplification Steps", escape = F, digits = 6) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+```{r echo=FALSE}
+#gls.exp.nug.fit.ml <- update(gls.exp.nug.fit, method='ML')
+# drop Age and refit
+# gls.exp1.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+#                          smoker.Time0 + smoker.Time1 + smoker.Time3 + Drugs + Cesd + Sex, 
+#                        correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+#                        data = cd4_df, method='ML')
+# sum.gls.exp1.nug.fit.ml <- summary(gls.exp1.nug.fit.ml)
+# anova(gls.exp.nug.fit.ml, gls.exp1.nug.fit.ml)
+# sum.gls.exp1.nug.fit.ml$tTable
+# gls.exp4.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+#                           Drugs + Cesd + Sex, 
+#                            correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+#                            data = cd4_df, method='ML')
+# take out smoker.Time0
+# gls.exp2.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+#                              smoker.Time1 + smoker.Time3 +
+#                              Drugs + Cesd + Sex, 
+#                            correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+#                            data = cd4_df, method='ML')
+# anova(gls.exp1.nug.fit.ml, gls.exp2.nug.fit.ml)
+# summary(gls.exp2.nug.fit.ml)
+# take out smoker.Time1
+# gls.exp3.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+#                              smoker.Time3 +
+#                              Drugs + Cesd + Sex, 
+#                            correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+#                            data = cd4_df, method='ML')
+# anova(gls.exp2.nug.fit.ml, gls.exp3.nug.fit.ml)
+# summary(gls.exp3.nug.fit.ml)
+# take out smoker.Time3
+# gls.exp4.nug.fit.ml <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+#                           Drugs + Cesd + Sex, 
+#                            correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+#                            data = cd4_df, method='ML')
+# anova(gls.exp3.nug.fit.ml, gls.exp4.nug.fit.ml)
+# summary(gls.exp4.nug.fit.ml)
+```
+Note that once the Age covariate is removed from the model, the presence or absence of the three smoker.Time variables makes little difference to the overall model fit. In fact, when each of these steps are performed in the sequence above, both the smoker.Time0 and smoker.Time1 variables are removed from the model but the smoker.Time3 variable is retained (at a 5% level). However, the penalty for removing this last term is small for a gain in model simplicity in terms of interpretability and therefore this has been removed from the model as well.
+
+Note that it is also of interest that the number of sexual partners covariate (Sex) has remained in the model in contrast to earlier expectations in this document. At this point the current model, refit with REML, is shown below.
+\footnotesize
+```{r}
+gls.exp.fit <- gls(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + Drugs + Cesd + Sex,
+                   correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)), data = cd4_df)
+AIC(gls.exp.fit)
+```
+\normalsize
+The final step is the introduction of any random effects. As stated at the start of this analysis, it is expected that a random effect on the individual intercept might be beneficial given the high between-subject heterogeneity. Further, the high within-subject variability may be well represented with random effects on subject-specific slopes.
+
+Shown below are three candidate mixed effects models. The first includes a random effect on the intercept term, the second on both the intercept term and the overall slope and the last more complex model attempts random effects on each of the slope terms of the original 3-knot piecewise linear model.
+\footnotesize
+```{r cache=TRUE}
+me.exp.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    Drugs + Cesd + Sex, data = cd4_df, 
+                  random = ~ 1 | ID,
+                  correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                  control = lmeControl(opt = 'optim', maxIter = 200))
+
+me.exp2.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    Drugs + Cesd + Sex, data = cd4_df, 
+                  random = ~ Time | ID,
+                  correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                  control = lmeControl(opt = 'optim', maxIter = 200))
+
+me.exp3.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                     Drugs + Cesd + Sex, data = cd4_df,
+                   random = ~ Time + Time0 + Time1 + Time3 | ID,
+                   correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                   control = lmeControl(opt = 'optim', maxIter = 200))
+```
+\normalsize
+When each of these models were fit, the AIC values were 14261.61, 14230.02 and 14247.21 respectively. Thus, introducing random effect terms on both the slope and intercept provides a better overall fit than either the third complex mixed effects model or the first intercept only model.
+
+In order to correctly test the significance of each of these random effects, we would need to use the parametric bootstrap as we do not actually know the distribution of the LR statistic under the null (it being a complex mix of chi-squares). However, it is interesting to note that if we do a LRT between the above two models, the test soundly rejects the more complex model. Even though we cannot trust the p-value here (0.8695), it is unlikely to change such that an opposite finding would result.
+
+Taking the simpler model as the best candidate for our final model we see that the introduction of a random effect on the intercept term allows the model to be simplified still further as the Drug use variable is no longer significant (p-val 0.0527). Removing this and re-fitting yields a final model with an AIC of 14226.69.
+
+```{r echo=FALSE, cache=TRUE}
+me.exp4.fit <- lme(CD4sqrt ~ Time*smoker + Time0 + Time1 + Time3 + 
+                    Cesd + Sex, data = cd4_df, 
+                  random = ~ Time | ID,
+                  correlation = corExp(form = ~ Time | ID, nugget = T, value=c(2, 0.1)),
+                  control = lmeControl(opt = 'optim', maxIter = 200))
+```
+
+A residual plot, a variogram and an ACF for the residuals from this final model are shown below:
+```{r echo=FALSE, out.height='50%', out.width='50%'}
+par(mfrow=c(1,2))
+plot(me.exp4.fit, form = resid(., level = 0) ~ fitted(.))
+me.exp4.fit.variogram <- Variogram(me.exp4.fit, form = ~ Time | ID, nint = 100, robust = T)
+plot(me.exp4.fit.variogram)
+plot(ACF(me.exp4.fit))
+```
+These plots indicate that this model has captured much of the between-subject and within-subject sources of variance as well as noise due to measurement error. In the ACF there is still some unrepresented correlation in the residuals but at lag 10 this is unlikely to be of concern as this is where data begins to become more sparse as the study continues and subjects are lost to follow up. The components of variability that this model does represent can be broken down as follows (derivation of these components is outlined in the appendix document):
+
+```{r echo=FALSE}
+sigma.b <- 3.870145 # (Intercept StdDev)
+sigma.squ.b <- sigma.b^2 # 14.97802
+sigma.squ.U.and.e <- 4.101988^2 # = 16.82631 (squared res std dev) 
+nugget <- 0.5739228
+sigma.squ.e <- nugget * sigma.squ.U.and.e # 9.657003
+sigma.squ.U <- sigma.squ.U.and.e - sigma.squ.e # = 7.169307
+```
+
+1. The variance due to the intercept random effect is $\sigma_b^2 \approx 14.978$
+2. The variance due to the correlated process is $\sigma_U^2 \approx 7.169$
+3. The variance due to random noise from measurement error is $\sigma_e^2 \approx 9.657$
+
+Plots assessing the normality of the residuals from both fixed effects and random effects are shown below.
+```{r echo=FALSE, out.height='50%', out.width='50%'}
+par(mfrow=c(1,2))
+qqnorm(me.exp4.fit, ~ resid(., type = "p"), abline = c(0, 1))
+qqnorm(me.exp4.fit, ~ ranef(.))
+```
+Again, this shows that the assumptions made by the model are fundamentally sound although we do note deviations from normality in the tails which may warrant further investigation (e.g. trying a heavier tailed distribution such as a t-distribution). Regardless, for the purposes of this work we appear to have a satisfactory model. 
+
+The model fixed effects estimates are shown below:
+
+\footnotesize
+```{r echo=FALSE}
+sum.me.exp4.fit <- summary(me.exp4.fit)
+round(sum.me.exp4.fit$tTable, digits = 4)
+```
+\normalsize
+Overall, the explanatory variables regarding behaviours that might be considered "risky", such as use of recreational drugs, multiple sexual partners and smoking all have positive estimated coefficients and therefore seem to be associated with increased levels of CD4 cell counts. 
+
+Higher depression scores are associated with a decrease in CD4 cell counts as of course does the progression of time. Note that for smokers, the interaction effect is negative indicating that the time affect on smokers is more pronounced than for non-smokers. Again, there is absolutely no basis here to infer any causality.
+
+The final mixed effects fitted model is shown below. Note that smoking status can (and does) vary throughout the study hence the use of the $j$ suffix.
+\begin{align*}
+E(Y_{ij}) &= \beta_1 + \beta_2t_{ij} + \beta_3smoker_{ij} + \beta_4(t_{ij}-0)_+ + \beta_5(t_{ij}-1)_+ + \beta_6(t_{ij}-3)_+ \\
+&+ \beta_7Cesd_{ij} + \beta_8Sex_{ij} + \beta_9 t_{ij} \times smoker_{ij} + b_{1i} + b_{2i}t_{ij} \\
+&= 29.052133 -0.291148t_{ij} + 1.849093smoker_{ij} -5.272980(t_{ij}-0)_+ + 2.827089(t_{ij}-1)_+ \\
+&+ 0.554318(t_{ij}-3)_+ -0.041219Cesd_{ij} + 0.099269Sex_{ij} -0.576220 t_{ij} \times smoker_{ij} + b_{1i} + b_{2i}t_{ij} \\
+\end{align*}
+
+The combination of random effects in the model, specifically on the intercept term (which induces a compound symmetry structure) and the exponential model for covariance structure results in a hybrid model for representing overall variability of the response. 
+
+This is particularly useful as it combines the advantages of the parametric exponential model given the highly unbalanced data at hand, with the real world empirical observations that measurement error is always present and therefore within-subject correlation cannot be zero. In addition, it can be shown (see Week 5 lecture 1) that the within-subject correlation is always less than one, which again aligns with real world experience.
+
+```{r echo=FALSE}
+# anova(me.exp.fit, me.exp2.fit)
+# Parametric bootstrap for significance
+para_pval <- function(mdl1, mdl2, nsim=100){
+  obs_lr <- anova(mdl1, mdl2)$'L.Ratio'[2]
+  pboot <- simulate(object=mdl1, m2=mdl2, nsim=nsim)
+  return(mean(null_lr>obs_lr))  
+}
+```
+
+**Application to Individual Trajectories**
+
+\normalsize
+Subject ID 30119 has 12 measurements spanning a six year period of the study which are fairly well balanced both before and after sero-conversion (represented here by the 5th and 6th measurements). Table 5 shows the variances extracted from the diagonal of the estimated variance-covariance matrix for this subject. It can be seen that the variance decreases prior to sero-conversion and subsequently increases throughout the post sero-conversion period. 
+
+```{r echo=FALSE, results='asis'}
+idx.30119 <- which(unique(cd4_df$ID) == 30119)
+var.cov.30119 <- getVarCov(me.exp4.fit, individual=c(idx.30119), type="marginal")
+cor.30119 <- cov2cor(var.cov.30119[[1]])
+kable(t(diag(var.cov.30119[[1]])), caption="Estimated Variances for Subject 30119", escape = F, digits = 2) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+```{r echo=FALSE, results='asis'}
+kable(t(cor.30119[1,]), caption="Estimated Correlations for Subject 30119", escape = F, digits = 2) %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+Table 6 shows the first (representative) row of the correlation matrix for this subject where we observe persistent positive correlation over the whole study period. This correlation decays fairly slowly with time overall but appears to decay slightly faster during the post sero-conversion period. Note that correlations do not decay to zero even when measurements are taken years apart - in this case over a six year period. The full estimated covariance and correlation matrices for this subject are included in the appendix document.
+
+In this section we have selected five subjects from the dataset such that they span the sero-conversion point and represent a range of high, medium and low responders as specified. For each subject, trajectories have been estimated using empirical BLUPs and plotted below. In addition, the estimated population mean response curve is shown in red for reference and the transformed observed CD4 cell counts for each subject are plotted as coloured crosses. 
+
+Note that each BLUP declines over time with several exhibiting varying slopes for each subject at the three knot points in the original model. Some BLUPs track observations closely (e.g. subjects 30119 and 10213) while others display far more variability over time (e.g. subjects 40286 and 20777). 
+
+The BLUP for subject 10213 closely tracks the population mean response whereas the BLUP for subject 20777 apears to diverge after sero-conversion. Both are examples of how individual subject variability is weighted against population mean response when BLUPs are calculated.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# get subject ids with 7 or more observations
+sub.ids.7.plus <- cd4_df %>% group_by(ID) %>% summarise(num_obs = max(obsnum)) %>% 
+  filter(num_obs >= 7) %>% arrange(ID, num_obs) %>% select(ID)
+cd4_7_df <- cd4_df %>% filter(ID %in% sub.ids.7.plus$ID)
+target_sids <- c(30119, 40286, 20777, 10213, 10453)
+target_df <- cd4_7_df %>% filter(ID %in% target_sids)
+# build covariate matrix for selected subjects
+X_df <- target_df %>% 
+  mutate(Intercept = rep(1, n())) %>% 
+  select(Intercept, Time, smoker, Time0, Time1, Time3, Cesd, Sex) %>% 
+  mutate(
+    Time.Smoker = Time * smoker
+  )
+```
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+calculate_blup <- function(subjectId, df, mdl.fit){
+  # extract subject design matrix
+  X.sub <- as.matrix(df %>% ungroup() %>% filter(ID == subjectId) %>% select(-ID))
+  # calculate fixed effects
+  fe.sub <- X.sub %*% mdl.fit$coefficients$fixed
+  # calculate random effects 
+  preds.sub <- mdl.fit$coefficients$random$ID[as.character(subjectId),]
+  X.re <- X.sub[,c(1,2)]
+  # do it componentwise and return data frame
+  re.sub <- X.re %*% preds.sub
+  blup.sub <- fe.sub + re.sub
+  blup.df.sub <- tibble(
+    ID = rep(subjectId, length(blup.sub)),
+    Time = X.re[,2],
+    Blup = blup.sub[,1]
+  )
+  return(blup.df.sub)
+}
+
+blup_df.30119 <- calculate_blup(30119, X_df, me.exp4.fit)
+blup_df.40286 <- calculate_blup(40286, X_df, me.exp4.fit)
+blup_df.20777 <- calculate_blup(20777, X_df, me.exp4.fit)
+blup_df.10213 <- calculate_blup(10213, X_df, me.exp4.fit)
+blup_df.10453 <- calculate_blup(10453, X_df, me.exp4.fit)
+```
+
+```{r echo=FALSE, results='asis'}
+ggplot(cd4_df)+
+  ggtitle('Population Average and BLUPs for Selected Subjects')+ xlab('Time (Years)')+ ylab('CD4 Sqrt')+
+  scale_x_continuous(breaks=x)+
+  geom_vline(xintercept = 0, colour='black', lty=5)+
+  annotate("text", label = "Seroconversion time", x = 0.1, y = 50, size = 4, colour = "black", hjust=0)+
+  geom_smooth(aes(x=yr, y=CD4sqrt), colour='red', se = F, method='loess', span=0.75)+
+  # 30119
+  geom_point(data=target_df %>% filter(ID == 30119), aes(x=yr, y=CD4sqrt), color='blue', shape=3)+
+  geom_line(data=blup_df.30119, aes(x=Time, y=Blup), color='blue', lwd=1)+
+  annotate("text", label = "30119", x = blup_df.30119[1,]$Time, y = blup_df.30119[1,]$Blup, size = 5, colour = "blue", hjust=0, vjust=-1)+
+
+  # 20777
+  geom_point(data=target_df %>% filter(ID == 20777), aes(x=yr, y=CD4sqrt), color='darkorange', shape=3)+
+  geom_line(data=blup_df.20777, aes(x=Time, y=Blup), color='darkorange', lwd=1)+
+  annotate("text", label = "20777", x = blup_df.20777[1,]$Time, y = blup_df.20777[1,]$Blup, size = 5, colour = "darkorange", hjust=0, vjust=-1)+
+
+  # 40286
+  geom_point(data=target_df %>% filter(ID == 40286), aes(x=yr, y=CD4sqrt), color='darkgreen', shape=3)+
+  geom_line(data=blup_df.40286, aes(x=Time, y=Blup), color='darkgreen', lwd=1)+
+  annotate("text", label = "40286", x = blup_df.40286[1,]$Time, y = blup_df.40286[1,]$Blup, size = 5, colour = "darkgreen", hjust=0, vjust=-1)+
+
+  # 10213
+  geom_point(data=target_df %>% filter(ID == 10213), aes(x=yr, y=CD4sqrt), color='steelblue', shape=3)+
+  geom_line(data=blup_df.10213, aes(x=Time, y=Blup), color='steelblue', lwd=1)+
+  annotate("text", label = "10213", x = blup_df.10213[1,]$Time, y = blup_df.10213[1,]$Blup, size = 5, colour = "steelblue", hjust=0, vjust=-1)+
+
+  # 10453
+  geom_point(data=target_df %>% filter(ID == 10453), aes(x=yr, y=CD4sqrt), color='black', shape=3)+
+  geom_line(data=blup_df.10453, aes(x=Time, y=Blup), color='black', lwd=1)+
+  annotate("text", label = "10453", x = blup_df.10453[1,]$Time, y = blup_df.10453[1,]$Blup, size = 5, colour = "black", hjust=0, vjust=-1)
+
+```
+
+**Discussion of Modelling**
+
+The main issues encountered in this work were to do with convergence and model specification syntax. The large number of observations precluded any feasible use of an unstructured covariance structure as a base to compare candidate covariance models using Likelihood Ratio Tests on REML fits.
+
+Moreover, the various combinations of the "form" and "weights" syntax in gls, lme and variograms made it difficult to be certain that all parts lined up correctly. This is obviously a matter of a lack of experience with longitudinal data analysis (that currently being somewhat less than nine weeks in total) and one that will be overcome with practice.
+
+In terms of the behaviour of the data itself, it was not clear whether to proceed down a more complex path and fit cubic splines and possibly other group effects regarding use of recreational drugs. Furthermore, this work focussed on modelling the CD4 cell count response post sero-conversion given the wide range of observed counts leading up to that time point. This allowed a more simple modelling approach given the observed 3-stage decline in response in this period and favoured a more parsimonious final model. 
+
+Lastly, the assumption of normality of residuals, while it appears to be reasonable, would be re-assessed in further work. This is fundamentally count data and it would make sense to attempt a model using a GLMM with a canonical Poisson link.
+
+\newpage
+\begin{thebibliography}{3}
+\bibitem{FLW}
+Fitzmaurice GM, Laird NM, and Ware JH.
+\textit{Applied Longitudinal Analysis, 2nd. Ed}.
+John Wiley and Sons, 2011.
+\bibitem{diggle}
+Diggle PJ, Heagerty P, Liang K-Y, and Zeger SL.
+\textit{Analysis of Longitudinal Data, 2nd. Ed}.
+Oxford University Press, 2002.
+\bibitem{digglePaper}
+Diggle PJ and Zeger SL.
+\textit{Semiparametric Models for Longitudinal Data with Application to CD4 Cell Numbers in HIV Seroconverters
+}.
+Biometrics, vol. 50, no. 3, pp. 689-699, (1994).
+\end{thebibliography}
